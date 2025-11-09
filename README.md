@@ -36,7 +36,7 @@ Key features:
 git clone https://github.com/karthikbhag/ProjectAnna.git  
 cd ProjectAnna  
 # checkout the branch  
-git checkout Tanish_branch  
+git checkout main 
 # (optional) create a venv  
 python -m venv venv  
 source venv/bin/activate  # on Unix/macOS  
