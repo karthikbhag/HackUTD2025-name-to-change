@@ -1,94 +1,124 @@
 """
-RoBERTa Sentiment Analysis Server with Nested JSON Support
-A Flask-based REST API server for sentiment analysis with support for both flat and nested JSON structures.
+Project Ana - Sentiment + Gemini Backend
 
-Installation:
-pip install flask transformers torch scipy pandas flask-cors
+Requirements:
+  pip install flask flask-cors transformers torch scipy python-dotenv google-genai==1.49.0
 
-Usage:
-python server.py
+Env:
+  .env in SAME FOLDER as this file:
 
-API Endpoints:
-- GET / - Serve HTML interface
-- POST /load_and_analyze - Load and analyze all JSON files
-- POST /analyze - Analyze single text
-- GET /health - Health check
+    GEMINI_API_KEY=your_real_key_here
 """
+
+import os
+import json
+import glob
+import logging
+import random
+from typing import Dict, List
+from pathlib import Path
 
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
+
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from scipy.special import softmax
-import logging
-import json
-import os
-import glob
-from typing import Dict, List
-from google import genai
+
 from dotenv import load_dotenv
+from google import genai
 
 # ==========================
-# 🔧 Configuration
+# 📂 Paths & Flask Setup
 # ==========================
-app = Flask(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+app = Flask(
+    __name__,
+    template_folder=str(BASE_DIR / "templates"),
+    static_folder=str(BASE_DIR / "static"),
+)
 CORS(app)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("project_ana")
 
-# Configure paths
-JSON_DATA_DIR = "data"  # Directory containing JSON files
+# Data dir: <project>/Data
+JSON_DATA_DIR = BASE_DIR / "Data"
 os.makedirs(JSON_DATA_DIR, exist_ok=True)
+logger.info(f"📁 JSON data dir: {JSON_DATA_DIR}")
 
 # ==========================
-# 🤖 Model Setup
+# 🔐 Gemini Setup (google-genai 1.49.0 style)
 # ==========================
+
+env_path = BASE_DIR / ".env"
+load_dotenv(env_path)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        f"❌ GEMINI_API_KEY not found. Create {env_path} with GEMINI_API_KEY=your_key"
+    )
+
+try:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    # Light sanity check
+    _ = list(gemini_client.models.list())
+    logger.info("✅ Gemini client initialized successfully.")
+except Exception as e:
+    raise RuntimeError(f"❌ Failed to initialize Gemini client: {e}")
+
+# ==========================
+# 🤖 Sentiment Model Setup
+# ==========================
+
 MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-logger.info(f"Loading model: {MODEL_NAME}")
-logger.info(f"Using device: {device}")
+logger.info(f"🔧 Loading sentiment model: {MODEL_NAME}")
+logger.info(f"💻 Using device: {device}")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME).to(device)
 model.eval()
 
-logger.info("✅ Model loaded successfully")
+logger.info("✅ Sentiment model loaded successfully.")
 
-# Cache for analyzed JSON data
-sentiment_cache = {}
+# Cache for analyzed results
+sentiment_cache: Dict[str, object] = {}
 
 # ==========================
-# 💬 Sentiment Analysis Function
+# 🧠 Sentiment Logic
 # ==========================
+
 def sentiment_analysis_improved(text: str) -> Dict:
-    """Compute sentiment with improved neutral detection."""
     if not text or not text.strip():
         return {
             "score": 3.0,
             "label": "neutral",
             "confidence": 1.0,
-            "probabilities": {"neg": 0.0, "neu": 1.0, "pos": 0.0}
+            "probabilities": {"neg": 0.0, "neu": 1.0, "pos": 0.0},
         }
-    
+
     inputs = tokenizer(
-        text, 
-        return_tensors="pt", 
-        truncation=True, 
+        text,
+        return_tensors="pt",
+        truncation=True,
         padding=True,
-        max_length=512
+        max_length=512,
     ).to(device)
 
     with torch.no_grad():
         outputs = model(**inputs)
-    
+
     logits = outputs.logits[0].cpu().numpy()
     probs = softmax(logits)
     p_neg, p_neu, p_pos = probs
-    
+
     score = 1 * p_neg + 3 * p_neu + 5 * p_pos
-    
+
     if p_neu > 0.5:
         label = "neutral"
     elif p_neg > 0.2 and p_pos > 0.2:
@@ -107,9 +137,9 @@ def sentiment_analysis_improved(text: str) -> Dict:
             label = "slightly positive"
         else:
             label = "slightly negative"
-    
+
     confidence = max(p_neg, p_neu, p_pos)
-    
+
     return {
         "score": round(float(score), 2),
         "label": label,
@@ -117,444 +147,508 @@ def sentiment_analysis_improved(text: str) -> Dict:
         "probabilities": {
             "neg": round(float(p_neg), 3),
             "neu": round(float(p_neu), 3),
-            "pos": round(float(p_pos), 3)
-        }
+            "pos": round(float(p_pos), 3),
+        },
     }
 
 # ==========================
-# 📁 JSON Processing Functions
+# 📦 JSON Processing
 # ==========================
+
 def extract_text_from_review(review: dict) -> str:
-    """Extract text from a review object, handling various field names."""
-    # Try title + text combination first
-    title = review.get('title', '')
-    text = review.get('text', '')
-    
+    title = (review.get("title") or "").strip()
+    text = (review.get("text") or "").strip()
+
     if title and text:
         return f"{title}. {text}"
-    elif text:
+    if text:
         return text
-    elif title:
+    if title:
         return title
-    
-    # Fallback to other common field names
-    for field in ['comment', 'review', 'content', 'message', 'body']:
-        if field in review and review[field]:
-            return str(review[field])
-    
+
+    for field in ["comment", "review", "content", "message", "body"]:
+        val = review.get(field)
+        if val:
+            return str(val)
     return ""
 
 def process_nested_json(json_data: dict, filename: str) -> List[Dict]:
-    """
-    Process nested JSON structure (tmobile_reviews.json format).
-    Structure: dataset["states"][i]["cities"][j]["stores"][k]["reviews"]
-    """
     results = []
-    
-    # Check if this is a nested structure
-    if "states" in json_data:
-        logger.info(f"Processing nested structure from {filename}")
-        
-        for state_obj in json_data.get("states", []):
-            state = state_obj.get("state", "Unknown")
-            
-            for city_obj in state_obj.get("cities", []):
-                city = city_obj.get("city", "Unknown")
-                
-                for store in city_obj.get("stores", []):
-                    store_info = {
-                        "store_id": store.get("store_id"),
-                        "store_name": store.get("store_name"),
-                        "address": store.get("address"),
-                        "city": store.get("city", city),
-                        "state": store.get("state", state)
-                    }
-                    
-                    for review in store.get("reviews", []):
-                        text = extract_text_from_review(review)
-                        
-                        if text:
-                            sentiment = sentiment_analysis_improved(text)
-                            
-                            result = {
-                                **store_info,
-                                "_source_file": filename,
-                                "_structure": "nested",
-                                "title": review.get("title", ""),
-                                "text": review.get("text", ""),
-                                "full_text": text,
-                                "original_rating": review.get("rating"),
-                                "original_sentiment": review.get("sentiment"),
-                                "date": review.get("date", ""),
-                                "sentiment_score": sentiment['score'],
-                                "sentiment_label": sentiment['label'],
-                                "sentiment_confidence": sentiment['confidence'],
-                                "sentiment_probabilities": sentiment['probabilities']
-                            }
-                            results.append(result)
-    
+    if "states" not in json_data:
+        return results
+
+    logger.info(f"📥 Processing nested JSON from {filename}")
+
+    for state_obj in json_data.get("states", []):
+        state = state_obj.get("state", "Unknown")
+
+        for city_obj in state_obj.get("cities", []):
+            city = city_obj.get("city", "Unknown")
+
+            for store in city_obj.get("stores", []):
+                store_info = {
+                    "store_id": store.get("store_id"),
+                    "store_name": store.get("store_name"),
+                    "address": store.get("address"),
+                    "city": store.get("city", city),
+                    "state": store.get("state", state),
+                }
+
+                for review in store.get("reviews", []):
+                    text = extract_text_from_review(review)
+                    if not text:
+                        continue
+
+                    sent = sentiment_analysis_improved(text)
+
+                    results.append({
+                        **store_info,
+                        "_source_file": filename,
+                        "_structure": "nested",
+                        "title": review.get("title", ""),
+                        "text": review.get("text", ""),
+                        "full_text": text,
+                        "original_rating": review.get("rating"),
+                        "original_sentiment": review.get("sentiment"),
+                        "date": review.get("date", ""),
+                        "sentiment_score": sent["score"],
+                        "sentiment_label": sent["label"],
+                        "sentiment_confidence": sent["confidence"],
+                        "sentiment_probabilities": sent["probabilities"],
+                    })
+
     return results
 
 def process_flat_json(json_data, filename: str) -> List[Dict]:
-    """
-    Process flat JSON structure (simple array or object format).
-    """
     results = []
-    
-    # Handle different flat structures
+
     if isinstance(json_data, list):
         items = json_data
     elif isinstance(json_data, dict):
-        # Check for various common keys that contain the data
-        items = json_data.get('posts',           # BlueSky posts
-                json_data.get('data',              # Generic data
-                json_data.get('comments',          # Comments
-                json_data.get('reviews',           # Reviews
-                json_data.get('items',             # Generic items
-                [json_data])))))                   # Fallback: treat dict as single item
+        items = json_data.get(
+            "posts",
+            json_data.get(
+                "data",
+                json_data.get(
+                    "comments",
+                    json_data.get(
+                        "reviews",
+                        json_data.get("items", [json_data]),
+                    ),
+                ),
+            ),
+        )
     else:
         return results
-    
-    logger.info(f"Processing flat structure from {filename} - found {len(items) if isinstance(items, list) else 0} items")
-    
+
+    if not isinstance(items, list):
+        items = [items]
+
+    logger.info(f"📥 Processing flat JSON from {filename}: {len(items)} items")
+
     for item in items:
-        if isinstance(item, dict):
-            text = extract_text_from_review(item)
-            
-            if text:
-                sentiment = sentiment_analysis_improved(text)
-                
-                result = {
-                    **item,
-                    "_source_file": filename,
-                    "_structure": "flat",
-                    "full_text": text,
-                    "sentiment_score": sentiment['score'],
-                    "sentiment_label": sentiment['label'],
-                    "sentiment_confidence": sentiment['confidence'],
-                    "sentiment_probabilities": sentiment['probabilities']
-                }
-                results.append(result)
-    
+        if not isinstance(item, dict):
+            continue
+
+        text = extract_text_from_review(item)
+        if not text:
+            continue
+
+        sent = sentiment_analysis_improved(text)
+
+        results.append({
+            **item,
+            "_source_file": filename,
+            "_structure": "flat",
+            "full_text": text,
+            "sentiment_score": sent["score"],
+            "sentiment_label": sent["label"],
+            "sentiment_confidence": sent["confidence"],
+            "sentiment_probabilities": sent["probabilities"],
+        })
+
     return results
 
-def load_and_process_json_file(filepath: str) -> List[Dict]:
-    """Load and process a JSON file, auto-detecting structure."""
+def load_and_process_json_file(path: Path) -> List[Dict]:
+    filename = path.name
     try:
-        filename = os.path.basename(filepath)
-        logger.info(f"Loading {filename}...")
-        
-        with open(filepath, 'r', encoding='utf-8') as f:
-            json_data = json.load(f)
-        
-        # Try nested structure first
-        if isinstance(json_data, dict) and "states" in json_data:
-            return process_nested_json(json_data, filename)
-        else:
-            return process_flat_json(json_data, filename)
-            
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict) and "states" in data:
+            return process_nested_json(data, filename)
+        return process_flat_json(data, filename)
+
     except Exception as e:
-        logger.error(f"Error loading {filepath}: {str(e)}")
+        logger.error(f"❌ Error loading {filename}: {e}")
         return []
 
 # ==========================
-# 🌐 API Routes
+# 🌐 Routes
 # ==========================
-@app.route('/')
+
+@app.route("/")
 def home():
     return render_template("project_ana.html")
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
+@app.route("/health", methods=["GET"])
+def health():
     return jsonify({
         "status": "healthy",
         "model": MODEL_NAME,
         "device": device,
-        "version": "v2_nested_support"
+        "gemini_client": True,
     }), 200
 
-@app.route('/load_and_analyze', methods=['POST'])
+@app.route("/load_and_analyze", methods=["POST"])
 def load_and_analyze():
-    """
-    Load all JSON files from data directory and analyze them.
-    Supports both flat and nested JSON structures.
-    
-    Response:
-    {
-        "results": [...],
-        "summary": {...}
-    }
-    """
     try:
-        # Get all JSON files
-        json_files = glob.glob(os.path.join(JSON_DATA_DIR, "*.json"))
-        
+        json_files = list(JSON_DATA_DIR.glob("*.json"))
+
         if not json_files:
             return jsonify({
-                "error": f"No JSON files found in '{JSON_DATA_DIR}' directory. Please add JSON files there.",
+                "error": f"No JSON files found in '{JSON_DATA_DIR}'.",
                 "results": [],
-                "summary": {}
+                "summary": {},
             }), 404
-        
-        all_results = []
-        file_info = []
-        
-        # Load and analyze each file
-        for filepath in json_files:
-            results = load_and_process_json_file(filepath)
+
+        all_results: List[Dict] = []
+        file_details = []
+
+        for path in json_files:
+            results = load_and_process_json_file(path)
             all_results.extend(results)
-            
-            filename = os.path.basename(filepath)
-            file_info.append({
-                "filename": filename,
+            file_details.append({
+                "filename": path.name,
                 "reviews_found": len(results),
-                "structure": results[0]["_structure"] if results else "unknown"
+                "structure": results[0]["_structure"] if results else "unknown",
             })
-        
-        # Remove duplicates based on full_text
-        seen_texts = set()
-        unique_results = []
-        duplicates_removed = 0
-        
-        for result in all_results:
-            text_key = result.get('full_text', result.get('text', ''))
-            if text_key and text_key not in seen_texts:
-                seen_texts.add(text_key)
-                unique_results.append(result)
-            else:
-                duplicates_removed += 1
-        
-        all_results = unique_results
-        logger.info(f"🗑️ Removed {duplicates_removed} duplicate reviews")
-        
-        # Calculate summary statistics
+
+        # Deduplicate by full_text
+        seen = set()
+        unique = []
+        for r in all_results:
+            key = r.get("full_text") or r.get("text") or ""
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(r)
+
+        all_results = unique
+        logger.info(f"✅ Total records after dedupe: {len(all_results)}")
+
+        # Summary
         if all_results:
-            label_counts = {}
+            labels = {}
+            total_score = 0.0
+            total_conf = 0.0
+            states, cities, stores = set(), set(), set()
+
             for r in all_results:
-                label = r['sentiment_label']
-                label_counts[label] = label_counts.get(label, 0) + 1
-            
-            avg_score = sum(r['sentiment_score'] for r in all_results) / len(all_results)
-            avg_confidence = sum(r['sentiment_confidence'] for r in all_results) / len(all_results)
-            
-            # Group by state and city if available
-            states = set()
-            cities = set()
-            stores = set()
-            
-            for r in all_results:
-                if 'state' in r and r['state']:
-                    states.add(r['state'])
-                if 'city' in r and r['city']:
-                    cities.add(r['city'])
-                if 'store_id' in r and r['store_id']:
-                    stores.add(r['store_id'])
-            
+                lbl = r["sentiment_label"]
+                labels[lbl] = labels.get(lbl, 0) + 1
+                total_score += r["sentiment_score"]
+                total_conf += r["sentiment_confidence"]
+
+                if r.get("state"):
+                    states.add(r["state"])
+                if r.get("city"):
+                    cities.add(r["city"])
+                if r.get("store_id"):
+                    stores.add(r["store_id"])
+
             summary = {
                 "total_comments": len(all_results),
                 "files_analyzed": len(json_files),
-                "file_details": file_info,
-                "label_distribution": label_counts,
-                "average_score": round(avg_score, 2),
-                "average_confidence": round(avg_confidence, 3),
+                "file_details": file_details,
+                "label_distribution": labels,
+                "average_score": round(total_score / len(all_results), 2),
+                "average_confidence": round(total_conf / len(all_results), 3),
                 "geographic_coverage": {
                     "states": len(states),
                     "cities": len(cities),
-                    "stores": len(stores)
-                }
+                    "stores": len(stores),
+                    "state_names": sorted(states),
+                    "city_names": sorted(cities),
+                    "store_ids": sorted(stores),
+                },
             }
         else:
             summary = {
                 "total_comments": 0,
                 "files_analyzed": len(json_files),
-                "file_details": file_info
+                "file_details": file_details,
             }
-        
-        # Cache for chatbot use later
-        sentiment_cache['latest'] = all_results
-        sentiment_cache['summary'] = summary
-        
-        logger.info(f"✅ Processed {len(all_results)} reviews from {len(json_files)} files")
-        
-        return jsonify({
-            "results": all_results,
-            "summary": summary
-        }), 200
-        
+
+        sentiment_cache["latest"] = all_results
+        sentiment_cache["summary"] = summary
+
+        return jsonify({"results": all_results, "summary": summary}), 200
+
     except Exception as e:
-        logger.error(f"Error in load_and_analyze: {str(e)}")
+        logger.error(f"❌ /load_and_analyze error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/filter_reviews', methods=['POST'])
+@app.route("/filter_reviews", methods=["POST"])
 def filter_reviews():
-    """
-    Filter cached reviews based on criteria.
-    
-    Request body:
-    {
-        "sentiment": "positive|negative|neutral|any",
-        "min_score": 1.0,
-        "max_score": 5.0,
-        "state": "Texas",  // optional
-        "city": "Dallas",  // optional
-        "store_id": "TX-DAL-001"  // optional
-    }
-    """
     try:
-        if 'latest' not in sentiment_cache:
-            return jsonify({
-                "error": "No data loaded. Please run /load_and_analyze first."
-            }), 400
-        
+        if "latest" not in sentiment_cache:
+            return jsonify({"error": "No data loaded. Call /load_and_analyze first."}), 400
+
         data = request.get_json() or {}
-        all_reviews = sentiment_cache['latest']
-        
-        # Extract filters
-        sentiment_filter = data.get('sentiment', 'any').lower()
-        min_score = float(data.get('min_score', 1.0))
-        max_score = float(data.get('max_score', 5.0))
-        state_filter = data.get('state')
-        city_filter = data.get('city')
-        store_filter = data.get('store_id')
-        
-        # Apply filters
+        reviews = sentiment_cache["latest"]
+
+        sentiment_filter = data.get("sentiment", "any").lower()
+        min_score = float(data.get("min_score", 1.0))
+        max_score = float(data.get("max_score", 5.0))
+        state = data.get("state")
+        city = data.get("city")
+        store = data.get("store_id")
+
         filtered = []
-        for review in all_reviews:
-            # Sentiment filter
-            if sentiment_filter != 'any':
-                if sentiment_filter not in review['sentiment_label'].lower():
-                    continue
-            
-            # Score filter
-            if not (min_score <= review['sentiment_score'] <= max_score):
+        for r in reviews:
+            if sentiment_filter != "any" and sentiment_filter not in r["sentiment_label"].lower():
                 continue
-            
-            # Geographic filters
-            if state_filter and review.get('state') != state_filter:
+            if not (min_score <= r["sentiment_score"] <= max_score):
                 continue
-            if city_filter and review.get('city') != city_filter:
+            if state and r.get("state") != state:
                 continue
-            if store_filter and review.get('store_id') != store_filter:
+            if city and r.get("city") != city:
                 continue
-            
-            filtered.append(review)
-        
-        # Calculate summary for filtered results
+            if store and r.get("store_id") != store:
+                continue
+            filtered.append(r)
+
+        summary = {"total_filtered": len(filtered)}
         if filtered:
-            label_counts = {}
+            labels = {}
+            total_score = 0.0
             for r in filtered:
-                label = r['sentiment_label']
-                label_counts[label] = label_counts.get(label, 0) + 1
-            
-            avg_score = sum(r['sentiment_score'] for r in filtered) / len(filtered)
-            
-            summary = {
-                "total_filtered": len(filtered),
-                "label_distribution": label_counts,
-                "average_score": round(avg_score, 2),
-                "filters_applied": {
-                    "sentiment": sentiment_filter,
-                    "score_range": f"{min_score}-{max_score}",
-                    "state": state_filter,
-                    "city": city_filter,
-                    "store": store_filter
-                }
-            }
-        else:
-            summary = {"total_filtered": 0}
-        
-        return jsonify({
-            "results": filtered,
-            "summary": summary
-        }), 200
-        
+                lbl = r["sentiment_label"]
+                labels[lbl] = labels.get(lbl, 0) + 1
+                total_score += r["sentiment_score"]
+            summary.update({
+                "label_distribution": labels,
+                "average_score": round(total_score / len(filtered), 2),
+            })
+
+        return jsonify({"results": filtered, "summary": summary}), 200
+
     except Exception as e:
-        logger.error(f"Error in filter_reviews: {str(e)}")
+        logger.error(f"❌ /filter_reviews error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/analyze', methods=['POST'])
-def analyze_sentiment():
-    """Analyze sentiment of a single text (kept for compatibility)"""
+@app.route("/analyze", methods=["POST"])
+def analyze_single():
     try:
-        data = request.get_json()
-        
-        if not data or 'text' not in data:
-            return jsonify({"error": "Missing 'text' field"}), 400
-        
-        text = data['text']
+        data = request.get_json() or {}
+        text = (data.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "Missing 'text'"}), 400
+
         result = sentiment_analysis_improved(text)
-        result['text'] = text
-        
+        result["text"] = text
         return jsonify(result), 200
-        
+
     except Exception as e:
-        logger.error(f"Error in analyze_sentiment: {str(e)}")
+        logger.error(f"❌ /analyze error: {e}")
         return jsonify({"error": str(e)}), 500
-@app.route('/chat', methods=['POST'])
 
-def chat_with_gemini():
+# ==========================
+# 💬 /chat with shortcuts
+# ==========================
+
+@app.route("/chat", methods=["POST"])
+def chat():
     """
-    Handle chatbot questions from the frontend.
-    Expected JSON:
-    {
-        "message": "User question",
-        "use_latest_data": true
-    }
+    Used by frontend.
+    Body: { "message": "...", "use_latest_data": true }
     """
-    try:
-        data = request.get_json()
-        message = data.get("message", "")
-        use_latest = data.get("use_latest_data", False)
+    if "latest" not in sentiment_cache or "summary" not in sentiment_cache:
+        return jsonify({"response": "Please load the data first from the dashboard."}), 400
 
-        if not message:
-            return jsonify({"response": "Please provide a valid message."}), 400
+    data = request.get_json() or {}
+    message = (data.get("message") or "").strip()
+    use_latest = data.get("use_latest_data", True)
 
-        # Load environment key
-        load_dotenv()
-        api_key = os.getenv("GEMINI_API_KEY")
+    if not message:
+        return jsonify({"response": "Please enter a question."}), 400
 
-        if not api_key:
-            return jsonify({"response": "❌ Missing GEMINI_API_KEY in .env"}), 500
+    all_reviews: List[Dict] = sentiment_cache["latest"]
+    summary: Dict = sentiment_cache["summary"]
+    lower = message.lower()
 
-        from google import genai
-        client = genai.Client(api_key=api_key)
+    geo = summary.get("geographic_coverage", {})
+    city_names = geo.get("city_names", []) or []
+    state_names = geo.get("state_names", []) or []
 
-        # Build dynamic context from cache (the reviews/posts already analyzed)
-        context = ""
-        if use_latest and 'latest' in sentiment_cache:
-            context = json.dumps(sentiment_cache['latest'][:50], indent=2)
+    # ---- Shortcut 1: "What users like" / "What do users like" ----
+    if "what do users like" in lower or "what users like" in lower or "what people like" in lower:
+        positive = [
+            r for r in all_reviews
+            if "positive" in r["sentiment_label"]
+        ]
+        # Use small subset to summarize
+        sample = positive[:100]
+        sample_texts = [r["full_text"] for r in sample]
 
         prompt = (
-            "You are Ana, an AI data analyst specialized in T-Mobile customer reviews.\n"
-            "Use the following data when relevant, and otherwise reply helpfully and conversationally.\n\n"
-            f"DATA:\n{context}\n\n"
-            f"User question: {message}"
+            "You are Ana, a T-Mobile Data Analyst.\n"
+            "Based ONLY on the following customer reviews (all positive or slightly positive), "
+            "summarize the top themes of what users like in 5 bullet points.\n\n"
+            + "\n\n".join(sample_texts)
         )
 
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt
+        try:
+            resp = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+            reply = getattr(resp, "text", None) or "Users appreciate network quality, staff, and promotions."
+            return jsonify({"response": reply}), 200
+        except Exception as e:
+            logger.error(f"❌ /chat like-summary error: {e}")
+            return jsonify({"response": "Error summarizing liked aspects."}), 500
+
+    # ---- Shortcut 2: "Main complaints" / "issues" / "problems" ----
+    if "complaint" in lower or "complaints" in lower or "issues" in lower or "problems" in lower:
+        negative = [
+            r for r in all_reviews
+            if "negative" in r["sentiment_label"]
+        ]
+        sample = negative[:100]
+        sample_texts = [r["full_text"] for r in sample]
+
+        prompt = (
+            "You are Ana, a T-Mobile Data Analyst.\n"
+            "Based ONLY on the following negative or slightly negative reviews, "
+            "summarize the main complaints in 5 bullet points.\n\n"
+            + "\n\n".join(sample_texts)
         )
 
-        return jsonify({"response": response.text})
+        try:
+            resp = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+            reply = getattr(resp, "text", None) or "Customers mention some issues with service, support, or billing."
+            return jsonify({"response": reply}), 200
+        except Exception as e:
+            logger.error(f"❌ /chat complaints-summary error: {e}")
+            return jsonify({"response": "Error summarizing complaints."}), 500
 
-    except Exception as e:
-        logger.error(f"Error in /chat: {str(e)}")
-        return jsonify({"response": f"Server error: {str(e)}"}), 500
-    
-    
+    # ---- Shortcut 3: "Top locations" / "best locations" ----
+    if ("top" in lower and "location" in lower) or ("best locations" in lower):
+        # Build location stats
+        location_map = {}
+        for r in all_reviews:
+            city = r.get("city")
+            state = r.get("state")
+            if not city:
+                continue
+            key = f"{city}, {state}" if state else city
+            if key not in location_map:
+                location_map[key] = {"pos": 0, "neg": 0, "total": 0}
+            location_map[key]["total"] += 1
+            lbl = r["sentiment_label"]
+            if "positive" in lbl:
+                location_map[key]["pos"] += 1
+            if "negative" in lbl:
+                location_map[key]["neg"] += 1
 
-# ==========================
-# 🚀 Run Server
-# ==========================
+        ranked = sorted(
+            location_map.items(),
+            key=lambda kv: (kv[1]["pos"] / kv[1]["total"], kv[1]["pos"]),
+            reverse=True,
+        )
+        top_n = ranked[:5]
 
-if __name__ == '__main__':
-    logger.info(f"📁 JSON files directory: {os.path.abspath(JSON_DATA_DIR)}")
-    logger.info("🔄 Supports both flat and nested JSON structures")
-    
-    app.run(
-        host='0.0.0.0',
-        port=5000,
-        debug=True
+        if not top_n:
+            return jsonify({"response": "I couldn't compute top locations from the data."}), 200
+
+        lines = []
+        for i, (loc, stats) in enumerate(top_n, start=1):
+            pct = (stats["pos"] / stats["total"]) * 100 if stats["total"] else 0
+            lines.append(
+                f"{i}. {loc} – {stats['pos']} positive out of {stats['total']} reviews ({pct:.0f}% positive)"
+            )
+
+        reply = "Here are the top performing locations based on sentiment:\n" + "\n".join(lines)
+        return jsonify({"response": reply}), 200
+
+    # ---- Shortcut 4: random city ----
+    if "random city" in lower:
+        if city_names:
+            city = random.choice(city_names)
+            return jsonify({"response": f"Here's a random city from the dataset: {city}"}), 200
+        return jsonify({"response": "I don't have any city names available in the data."}), 200
+
+    # ---- Shortcut 5: specific city like "dallas" ----
+    for city in city_names:
+        if city.lower() in lower:
+            city_reviews = [r for r in all_reviews if str(r.get("city", "")).lower() == city.lower()]
+            if city_reviews:
+                pos = sum(1 for r in city_reviews if "positive" in r["sentiment_label"])
+                neg = sum(1 for r in city_reviews if "negative" in r["sentiment_label"])
+                neu = len(city_reviews) - pos - neg
+                reply = (
+                    f"In {city}, based on {len(city_reviews)} reviews: "
+                    f"{pos} positive, {neg} negative, {neu} neutral/slightly mixed."
+                )
+                return jsonify({"response": reply}), 200
+            else:
+                return jsonify({
+                    "response": f"{city} appears in coverage, but I couldn't find detailed reviews stored for it."
+                }), 200
+
+    # ---- Fallback: full Gemini Q&A grounded in data ----
+
+    if not use_latest:
+        # If user explicitly disables data grounding
+        system_instruction = (
+            "You are Ana, a helpful T-Mobile assistant. "
+            "Respond briefly and professionally."
+        )
+        try:
+            session = gemini_client.chats.create(
+                model="gemini-2.5-flash",
+                config={"system_instruction": system_instruction},
+            )
+            resp = session.send_message(message)
+            reply = getattr(resp, "text", None) or "I couldn't generate a response."
+            return jsonify({"response": reply}), 200
+        except Exception as e:
+            logger.error(f"❌ /chat ungrouned error: {e}")
+            return jsonify({"response": f"Server error: {e}"}), 500
+
+    # Grounded mode: summary + sample
+    sample = all_reviews[:80]
+    context = (
+        "You are Ana, a T-Mobile Data Analyst Bot. "
+        "Use ONLY the JSON data below to answer questions. "
+        "If something is not supported by these data, say you cannot find it.\n\n"
+        "DATA SUMMARY:\n"
+        f"{json.dumps(summary, indent=2, ensure_ascii=False)}\n\n"
+        "SAMPLE ENTRIES:\n"
+        f"{json.dumps(sample, indent=2, ensure_ascii=False)}"
     )
+
+    try:
+        session = gemini_client.chats.create(
+            model="gemini-2.5-flash",
+            config={"system_instruction": context},
+        )
+        resp = session.send_message(message)
+        reply = getattr(resp, "text", None) or "I couldn't generate a response."
+        return jsonify({"response": reply}), 200
+    except Exception as e:
+        logger.error(f"❌ /chat fallback error: {e}")
+        return jsonify({"response": f"Server error: {e}"}), 500
+
+# ==========================
+# 🚀 Run
+# ==========================
+
+if __name__ == "__main__":
+    logger.info("🚀 Project Ana server starting...")
+    logger.info(f"Using .env from: {env_path}")
+    app.run(host="0.0.0.0", port=5000, debug=True)
