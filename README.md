@@ -43,6 +43,22 @@ source venv/bin/activate  # on Unix/macOS
 venv\Scripts\activate     # on Windows  
 # install dependencies  
 pip install -r requirements.txt
+```
 
-### Installation  
+### Usage
+1. Place JSON files you want to analyze into Data/.
+2. Run the server:
+   ```
+   python Sentiment_Analysis_Server.py
+   ```
+   It will load the model and start serving at http://0.0.0.0:5000.
+3. Send POST requests to the server with JSON payload or upload via UI (if present).
+4. View returned sentiment scores or download output.
 
+
+📝 Model Training / Fine-Tuning
+
+For advanced users:
+- Open ```Roberta training.ipynb``` to explore training/fine-tuning steps.
+- Use your own labeled dataset to train the ```twitter-roberta-base-sentiment``` model.
+- After training, update ```MODEL_NAME``` in server code to your custom model.
