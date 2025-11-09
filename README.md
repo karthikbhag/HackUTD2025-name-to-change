@@ -1,9 +1,9 @@
-# Project Anna
+# Project_Ana
 
 **HackUTD 2025**
 
 ## 🚀 Overview  
-Project Anna is an AI-powered web application that performs sentiment analysis on JSON data. It uses the **twitter-roberta-base-sentiment** model from Transformers and exposes a Flask server for real-time analysis.  
+Project_Ana is an AI-powered web application that performs sentiment analysis on JSON data. It uses the **twitter-roberta-base-sentiment** model from Transformers and exposes a Flask server for real-time analysis.  
 Key features:  
 - Accepts flat or nested JSON files for processing.  
 - Provides a REST-ful endpoint served via Flask.  
